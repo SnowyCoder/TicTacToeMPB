@@ -1,0 +1,260 @@
+#!/bin/bash
+
+if (( $# < 1 )); then
+  echo "Usage: trismp <server|client>" >&2
+  exit 1
+fi
+
+initPipeKeepaliveSleep() {
+  # Keep the output pipe alive even after other commands try to close it
+  sleep infinity < .tout > .tin &
+}
+
+initServerConn() {
+  mkfifo .tin .tout
+  cat .tin | nc -l $1 | cat > .tout &
+  if (( $? != 0 )); then
+    echo "Server initialization failed: $?" >&2
+    exit 2
+  fi
+  initPipeKeepaliveSleep
+}
+
+initClientConn() {
+  mkfifo .tin .tout
+  cat .tin | nc $1 $2 | cat > .tout &
+  if (( $? != 0 )); then
+    echo "Client initialization failed: $?" >&2
+    exit 2
+  fi
+  initPipeKeepaliveSleep
+}
+
+cleanup() {
+  # Kill the programs used so that no process is left pending
+  killall nc cat sleep
+  # Remove the input/output pipes
+  rm .tin .tout
+}
+
+# Execute cleanup when this program closes
+# (even if it closes by error)
+trap cleanup EXIT
+
+
+case $1 in
+s|server)
+  if (( $# < 2)); then
+    echo "Usage: trismp server <port>" >&2
+    exit 1
+  fi
+  initServerConn $2
+  isServer=1
+  ;;
+c|client)
+  if (( $# < 3)); then
+    echo "Usage: trismp client <ip> <port>" >&2
+    exit 1
+  fi
+  initClientConn $2 $3
+  isServer=0
+  ;;
+*)
+  echo "Usage: trismp <server|client>" >&2
+  exit 1
+  ;;
+esac
+
+# Tris numeration:
+# 012
+# 345
+# 678
+# (The user sees everything + 1)
+
+# Table used to store game
+table=(
+  0 0 0
+  0 0 0
+  0 0 0
+)
+
+ourMove=${isServer}
+
+# GAME LOGIC
+
+charFromPlayer() {
+  case $1 in
+  0) echo " ";;
+  1) echo "X";;
+  2) echo "O";;
+  esac
+}
+
+getFSlot() {
+ charFromPlayer ${table[$1]}
+}
+
+isMoveValid() {
+  # Checks if the slot is already occupied
+  if (( ${table[$1]} == 0 )) ; then
+    echo true
+  else
+    echo false
+  fi
+}
+
+clearGame() {
+  # Clear the game table
+  # Expecting that the other side does it too...
+  for i in {0..8}; do
+    table[$i]=0
+  done
+}
+
+checkWin() {
+  #  0 = Game still playing
+  #  1 = player
+  #  2 = opponent
+  # -1 = draw
+  if   [ ${table[0]} = ${table[1]} ] && [ ${table[1]} = ${table[2]} ]; then
+    # xxx
+    # 000
+    # 000
+    echo ${table[0]}
+  elif [ ${table[3]} = ${table[4]} ] && [ ${table[4]} = ${table[5]} ]; then
+    # 000
+    # xxx
+    # 000
+    echo ${table[3]}
+  elif [ ${table[6]} = ${table[7]} ] && [ ${table[7]} = ${table[8]} ]; then
+    # 000
+    # 000
+    # xxx
+    echo ${table[6]}
+  elif [ ${table[0]} = ${table[3]} ] && [ ${table[3]} = ${table[6]} ]; then
+    # x00
+    # x00
+    # x00
+    echo ${table[0]}
+  elif [ ${table[1]} = ${table[4]} ] && [ ${table[4]} = ${table[7]} ]; then
+    # 0x0
+    # 0x0
+    # 0x0
+    echo ${table[1]}
+  elif [ ${table[2]} = ${table[5]} ] && [ ${table[5]} = ${table[8]} ]; then
+    # 00x
+    # 00x
+    # 00x
+    echo ${table[2]}
+  elif [ ${table[0]} = ${table[4]} ] && [ ${table[4]} = ${table[8]} ]; then
+    # x00
+    # 0x0
+    # 00x
+    echo ${table[0]}
+  elif [ ${table[2]} = ${table[4]} ] && [ ${table[4]} = ${table[6]} ]; then
+    # 00x
+    # 0x0
+    # x00
+    echo ${table[2]}
+  else
+    for i in {0..8}; do
+      if (( ${table[$i]} == 0 )); then
+        echo 0 # No winner but no draw
+        return
+      fi
+    done
+    echo -1 # Draw
+  fi
+}
+
+makeMove() {
+  table[$1]=1
+  # Send command move to other side
+  # (.tin is the input pipe of the connection)
+  echo "move $1" > .tin
+}
+
+receiveMove() {
+  # Update the table with the other side's choice
+  table[$1]=2
+}
+
+display() {
+  echo "$(getFSlot 0)┃$(getFSlot 1)┃$(getFSlot 2)"
+  echo '━╋━╋━'
+  echo "$(getFSlot 3)┃$(getFSlot 4)┃$(getFSlot 5)"
+  echo '━╋━╋━'
+  echo "$(getFSlot 6)┃$(getFSlot 7)┃$(getFSlot 8)"
+}
+
+while : ; do
+  clear
+  display
+
+  if [ ${ourMove} -eq 1 ] ; then
+    # Our turn!
+    while : ; do
+      # Ask for move
+      echo -n "you>"
+      read inMove
+
+      # Check move validity
+      if [[ ${inMove} =~ ^[1-9]$ ]]; then
+        # Transform 1-9 space into 0-8
+        inMove=$(( inMove - 1 ))
+
+        # if the move is valid, exit from the input loop
+        [ $(isMoveValid ${inMove}) = true ] && break
+      fi
+    done
+
+    # Process the move
+    makeMove ${inMove}
+
+    # And switch the sides
+    ourMove=0
+  else
+    # Opponent's turn
+    # Wait for other side's move (or command)
+    while read line ; do
+      case ${line} in
+      move\ [0-8]) # If the command is "move n" (the only one supported for now)
+        # Get the selected slot
+        moveNumber=$(echo ${line} | cut -f 2 -d ' ')
+        # Process it
+        receiveMove ${moveNumber}
+        # Switch movers
+        ourMove=1
+        break # And exit the loop
+        ;;
+      *)
+        echo "Unexpcted command: '${line}'"
+        ;;
+      esac
+    done < .tout # Get the connection input (.tout is the output of the other side, so our input)
+  fi
+
+  winner=$(checkWin)
+  if ! [ "$winner" = "0" ] ; then # If there's a winner
+    clear
+    display
+
+    if (( $winner != -1 )); then # And it's a real winner
+      # Print him
+      echo "WINNER:" $(charFromPlayer ${winner})
+    else # If it's a draw instead
+      # Well, print that too!
+      echo "DRAW"
+    fi
+
+    # Read a line so that the loser suffers a little bit
+    read _ignore_
+    # Restart the game
+    clearGame
+    # Note: now the loser has the first turn
+  fi
+done
+
+
+
+
